@@ -1,0 +1,173 @@
+Subject: Godot - Scons introduction
+From: Rémi Verschelde <remi@godotengine.org>
+Date: 9/14/20, 5:26 AM
+
+Now for the technical details:
+
+To add to what Juan was writing, we've been using SCons since before
+Godot was open sourced in 2014, and quite happy with it. I think Juan
+already used it for other projects back in the 2000s judging by
+https://github.com/reduz/chibitracker
+
+As you probably know well, SCons doesn't feature in the typical
+toolset of the "cool kids" that tend to gravitate around game engine
+projects like Godot, so we've had endless debates about the pros and
+cons of other buildsystems and people trying to convince us to switch
+to <current trendy option>. But we're happy with what we have, and
+don't see a need to change what's not broken and trade a set of known
+limitations for an unknown one. Godot is a very cross-platform
+codebase and the flexibility that we get from SCons and raw Python
+scripts to handle different hosts, targets, compilers and tools is
+awesome. So knowing that we don't intend to jump ship, we're however
+interested in seeing what can be improved in our current SCons setup,
+or possibly directly upstream, to ensure that our contributors have a
+great experience using SCons. There are two areas where we think work
+can be done:
+
+- Performance; both clean builds and null builds tend to take longer
+than we'd want, and we think some of it might be on SCons' side
+(and/or our non-optimal usage of SCons). Some contributors also tend
+to have issues with incremental builds, and maybe we need to poke more
+at the Decider implementation/make our own to make sure that it fits
+our workflow.
+
+- Architecture/maintenance: Godot's buildsystem was likely written by
+Juan initially, who is not a SCons guru, so he used the minimal
+feature set he needed from the docs and then hacked around that. We've
+kept doing the same process while adding new features to handle
+Godot's growing complexity, sometimes picking up new SCons features
+from the manual to refactor existing code or to better implement new
+code, but there's likely a lot of room for improvement to make things
+more SCons-like and better suited to benefit from current and future
+improvements to upstream SCons.
+
+Now for your questions:
+
+I just opened this issue to get reports on how long clean builds and
+null builds take for the various contributors:
+https://github.com/godotengine/godot/issues/42048
+We should see some more results in coming days to get a better picture
+of the current status.
+
+For documentation on how the current buildsystem is implemented, I
+fear we don't really have much beyond the source code.
+But I'll try to give a broad overview here.
+
+- As expected, the entry point in SConstruct, and it loads subsidiary
+scripts for the different parts of the engine here:
+https://github.com/godotengine/godot/blob/6ee1b786243e27271bfd62c9d70260cad421a3c4/SConstruct#L651-L664
+  (which themselves can further load subsidiary scripts based on
+configuration). No idea where the non-standard `SCsub` name comes
+from, it seems to predate Godot's open sourcing (and I wasn't involved
+then).
+
+- We have various python scripts which we use to configure the build, namely:
+  * methods.py contains various methods used throughout the
+buildsystem, either after importing `methods`, or sometimes hacked
+into the base environment to look like built-in SCons commands (like
+`CommandNoCache`, or `add_source_files`). This could probably be done
+differently by using the scons-site feature for custom builders and
+tools I suppose.
+  * There are various <something>_builders.py scripts which are indeed
+used to generate C++ headers from markdown files, text files, XML
+data, GLSL, PNGs, and more. Typically each engine part has its own
+collection of "builders" (like `core/core_builders.py`,
+`editor/editor_builders.py`).
+  * Each platform port has a `platform/<name>/detect.py` script which
+is called in SConstruct at
+https://github.com/godotengine/godot/blob/6ee1b786243e27271bfd62c9d70260cad421a3c4/SConstruct#L28-L50
+to see if it's valid on the current host. So adding platform ports to
+Godot is just a matter of adding new folders in `platforms` with a
+`detect.py` that should handle the rest.
+  * Similarly, each module has a `modules/<name>/config.py` used to
+check if the module can be built in the current env and platform
+config, and if so do appropriate env configuration steps. So modules
+can be easily added/removed simply by adding/removing folders (though
+instead of removing built-in modules, there's a SCons option for each
+of them generated in SConstruct to disable them:
+https://github.com/godotengine/godot/blob/master/SConstruct#L208-L220).
+
+- Godot includes thirdparty code in the `thirdparty` folder. We don't
+use upstream buildsystems for those libraries, and instead we write
+our own `SCsub` for each library to build only what we need with the
+options we need. Most thirdparty libraries are linked to modules, so
+we typically have a construct where it's the module's SCsub which is
+responsible for building the thirdparty code needed by its module,
+unless the `builtin_<library>` option is disabled (to allow unbundling
+thirdparty code on Linux distros when packaging Godot, e.g. to build
+against the system libpng, freetype, etc.). Here's an example for the
+pcre2 library: https://github.com/godotengine/godot/blob/master/modules/regex/SCsub
+
+- As seen in https://github.com/godotengine/godot/blob/master/modules/regex/SCsub,
+we've taken the habit to clone the environment every time we go down a
+folder to try to keep things well compartmentalized. For example, the
+pcre2 custom defines are only relevant to build the modules/regex and
+thirdparty/pcre2 code. The rest of the engine should not be affected
+by those implementation details for a thirdparty library, so we don't
+want their build environment affected. So in modules/SCsubs, the main
+`env` is cloned to `env_modules`. In modules/regex/SCsub,
+`env_modules` is cloned to `env_regex`, and even further for the
+thirdparty code we clone again to be able to disable compilation
+warnings in code we don't own, and in this example also override
+OBJSUFFIX to account for the two variants of pcre2 that we build.
+This work OK, but we're not at all confident that this isn't the root
+of many of our hurdles with performance. There are likely better ways
+to do what we have implemented, but most of it has been built by
+hacking around along the years, without really sitting down to master
+all SCons features before redesigning it all (hence our need for
+expert advice :)).
+
+- Each top-level folder of the engine builds its own static library,
+which are then all linked into the executable. Recently, we've also
+split each module in its own library. This helps reduce the command
+line length which has always been problematic on Windows, as we have
+way more objects to link eventually than Windows cmd can handle.
+Ideally we'd want each of those libraries to be left alone and used as
+is if none of its dependent files are changed, but it doesn't seem to
+always be reliable (module libs especially tend to be rebuilt more
+often than we'd like). Example:
+https://github.com/godotengine/godot/blob/master/modules/SCsub#L38-L66
+
+- There's some doubt on the Decider that we use, which seems to impact
+the incremental builds negatively:
+https://github.com/godotengine/godot/blob/master/SConstruct#L245-L250
+Godot quite a few files and we're not confident that the SCons setup
+we use would properly ensure that needed changes to those files are
+picked up, so currently we use MD5-timestamp. It does seem to be a bit
+trigger happy, especially when using Git to checkout different
+branches / pull / rebase, etc., where quite often non-changed files
+will be rebuilt *seemingly* randomly.
+
+- On Windows, we have our own custom Visual Studio project files
+generation in methods.py:
+https://github.com/godotengine/godot/blob/6ee1b786243e27271bfd62c9d70260cad421a3c4/methods.py#L529-L594
+I think I've seen related stuff in SCons upstream so maybe it's
+something we could phase out eventually to rely on upstream features?
+
+- All in all, while we try to keep things well compartmentalized,
+there are things here and there that break our encapsulation
+principles and force us to do hacky things.
+For example we generate a header which lists enabled modules, so that
+we can enable some code conditionally based on the presence or not of
+a module: https://github.com/godotengine/godot/blob/6ee1b786243e27271bfd62c9d70260cad421a3c4/modules/SCsub#L12-L36
+Some modules also depend on each others and we don't have any clean
+dependency system, so it's all hacked:
+https://github.com/godotengine/godot/blob/master/modules/theora/SCsub#L75-L79
+Or worse, some so-called "modules" aren't actually modules but are
+used by the "scene" folder (which is registered before and thus linked
+after modules), so we need to hack the LIBS to insert the static lib
+at the right place, like for freetype:
+https://github.com/godotengine/godot/blob/master/modules/freetype/SCsub#L84-L99
+In practice, freetype should likely not be a module but built as part
+of `scenes/SCsub`, but since we tend to give the responsibility of
+thirdparty code to modules (and freetype support used to be opt-out
+with a fallback on stb_truetype, though it's no longer the case), it
+was put there for convenience.
+
+I guess that's it for a quick overview of the current setup and some
+of its design issues.
+We don't necessarily expect you to solve all the design problems
+outlined above, but it's good that you're aware of them and you're
+welcome to give recommendations on how we could improve things further
+to be more idiomatic SCons and have less surface for reliability or
+performance issues.
